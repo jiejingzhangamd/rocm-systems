@@ -1016,6 +1016,8 @@ completion_monitor_loop(completion_monitor& mon)
     auto conds   = std::vector<hsa_signal_condition_t>{};
     auto values  = std::vector<hsa_signal_value_t>{};
     auto scratch = pending_completion_vector_t{};
+    const auto single_signal_wait =
+        common::get_env("ROCPROFILER_EXPERIMENTAL_SINGLE_SIGNAL_WAIT", false);
 
     while(true)
     {
@@ -1044,6 +1046,43 @@ completion_monitor_loop(completion_monitor& mon)
                                                          0,
                                                          std::numeric_limits<uint64_t>::max(),
                                                          HSA_WAIT_STATE_BLOCKED);
+            continue;
+        }
+
+        // Diagnostic compatibility mode for ROCr builds whose wait_any corrupts
+        // the satisfying-value array when a nonzero signal index completes.
+        // The default path and its timing remain unchanged. Polling uses the
+        // installed single-signal HSA API and checks the wake signal every pass.
+        if(single_signal_wait)
+        {
+            bool completed = false;
+            for(const auto& pending : mon.active)
+            {
+                const auto value = get_core_table()->hsa_signal_wait_relaxed_fn(
+                    pending.completion_signal,
+                    HSA_SIGNAL_CONDITION_LT,
+                    pending.starting_value,
+                    0,
+                    HSA_WAIT_STATE_ACTIVE);
+                if(value < pending.starting_value)
+                {
+                    completed = true;
+                    break;
+                }
+            }
+            if(completed)
+                retire_completed(mon, scratch);
+            else
+            {
+                // The second inbox drain above precedes this check. A later
+                // producer wake is observed on the next bounded polling pass.
+                get_core_table()->hsa_signal_wait_relaxed_fn(mon.wake_signal,
+                                                             HSA_SIGNAL_CONDITION_NE,
+                                                             0,
+                                                             0,
+                                                             HSA_WAIT_STATE_ACTIVE);
+                std::this_thread::sleep_for(poll_interval);
+            }
             continue;
         }
 

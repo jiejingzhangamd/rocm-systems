@@ -42,6 +42,47 @@ patterns. Run with a compatible SDK/native tool build and runtime library paths:
 SDK_BUILD=/absolute/sdk-build bash projects/rocprofiler-sdk/tests/graph-attribution-experiments/run_memset_native.sh /absolute/new-results
 ```
 
+## ROCm 7.2 profiler compatibility diagnostics
+
+The optional `ROCPROFILER_EXPERIMENTAL_SINGLE_SIGNAL_WAIT=1` path polls each
+completion signal individually when the runtime's multi-signal wait is
+unreliable. It is off by default. The native JSON metadata now reports actual
+per-buffer cumulative drop counters; a missing counter must not be interpreted
+as zero dropped records.
+
+The experimental dispatch strict-window API is also disabled by default. An
+observer in the profiled process may call
+`rocprofiler_experimental_set_dispatch_strict_window(start_ns, end_ns)` on the
+loaded SDK library. These bounds are in the SDK's timestamp domain and select
+dispatches by their **original CPU enqueue timestamp**. The end may initially be
+`UINT64_MAX` and be sealed after GPU synchronization. The observer should read
+back both bounds with `rocprofiler_experimental_get_dispatch_strict_window` and
+record them with its selected request/phase window. A zero or reversed bound
+disables the override. `ROCPROFILER_CI_STRICT_TIMESTAMPS=1` still applies its
+original global strict check; a selected dispatch also triggers that same check
+when the global setting is off. Startup/capture GPU times outside a selected
+window can still undergo the SDK's usual correction and are not admitted as
+precise device timing.
+
+Within the opt-in window only, if a raw GPU end timestamp is slightly ahead of
+the host clock immediately after the HSA timing query, the SDK waits up to
+10 microseconds for the host clock to reach that timestamp. It does not shift
+the raw GPU interval; a larger gap still fails the strict check. The native JSON
+metadata reports the number of such waits, the maximum initial gap, total wait
+time and fixed limit. These waits are profiler overhead and are not a latency
+correction or evidence of a cross-stream dependency.
+
+The exported selection predicate can be checked against a built SDK without
+starting a GPU workload:
+
+```bash
+python3 projects/rocprofiler-sdk/tests/graph-attribution-experiments/validate_scoped_strict.py /absolute/sdk-build/lib/librocprofiler-sdk.so
+```
+
+This API supplies no graph-to-operator mapping, event/barrier duration,
+cross-stream critical path, or profiler overhead estimate. Validate those
+separately on the actual workload before making a performance claim.
+
 ## Native reproduction
 
 Build the SDK shared library and `rocprofiler-sdk-json-tool` with tests enabled.

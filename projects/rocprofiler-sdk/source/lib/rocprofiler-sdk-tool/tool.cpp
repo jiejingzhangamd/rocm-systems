@@ -25,6 +25,7 @@
 
 #include "att_no_intercept.hpp"
 #include "config.hpp"
+#include "drop_counts.hpp"
 #include "execution_profile.hpp"
 #include "graph_stack.hpp"
 #include "helper.hpp"
@@ -137,6 +138,9 @@ namespace common = ::rocprofiler::common;
 namespace tool   = ::rocprofiler::tool;
 namespace fs     = ::rocprofiler::common::filesystem;
 
+extern "C" void rocprofiler_experimental_get_dispatch_strict_bound_wait(
+    uint64_t* count, uint64_t* max_gap_ns, uint64_t* total_wait_ns, uint64_t* limit_ns);
+
 extern "C" {
 void
 rocprofv3_error_signal_handler(int signo, siginfo_t*, void*);
@@ -144,6 +148,13 @@ rocprofv3_error_signal_handler(int signo, siginfo_t*, void*);
 
 namespace
 {
+rocprofiler_clock_audit::drop_counts& observed_buffer_drops()
+{
+    // Callback teardown may outlive ordinary static destructors.
+    static auto* counts = new rocprofiler_clock_audit::drop_counts{};
+    return *counts;
+}
+
 // Thread for safe cleanup output generation
 auto output_generation_thread = common::Synchronized<std::optional<std::thread>>{};
 
@@ -1255,21 +1266,24 @@ code_object_tracing_callback(rocprofiler_callback_tracing_record_t record,
 
 void
 dummy_buffered_tracing_callback(rocprofiler_context_id_t /*context*/,
-                                rocprofiler_buffer_id_t /*buffer_id*/,
+                                rocprofiler_buffer_id_t buffer_id,
                                 rocprofiler_record_header_t** /*headers*/,
                                 size_t /*num_headers*/,
                                 void* /*user_data*/,
-                                uint64_t /*drop_count*/)
-{}
+                                uint64_t drop_count)
+{
+    observed_buffer_drops().observe(buffer_id.handle, drop_count);
+}
 
 void
 buffered_tracing_callback(rocprofiler_context_id_t /*context*/,
-                          rocprofiler_buffer_id_t /*buffer_id*/,
+                          rocprofiler_buffer_id_t buffer_id,
                           rocprofiler_record_header_t** headers,
                           size_t                        num_headers,
                           void* /* user_data*/,
-                          uint64_t /*drop_count*/)
+                          uint64_t drop_count)
 {
+    observed_buffer_drops().observe(buffer_id.handle, drop_count);
     ROCP_INFO << "Executing buffered tracing callback for " << num_headers << " headers";
 
     if(!headers) return;
@@ -1831,12 +1845,13 @@ get_att_perfcounter_params(rocprofiler_agent_id_t                           agen
 
 void
 pc_sampling_callback(rocprofiler_context_id_t /* context_id*/,
-                     rocprofiler_buffer_id_t /* buffer_id*/,
+                     rocprofiler_buffer_id_t buffer_id,
                      rocprofiler_record_header_t** headers,
                      size_t                        num_headers,
                      void* /*data*/,
-                     uint64_t /* drop_count*/)
+                     uint64_t drop_count)
 {
+    observed_buffer_drops().observe(buffer_id.handle, drop_count);
     if(!headers) return;
 
     // count number of valid VS invalid samples delivered by this callback
@@ -4050,6 +4065,24 @@ generate_config_output(const tool::config& cfg, const tool::metadata& tool_metad
         archive(cereal::make_nvp("pid", this_pid));
         archive(cereal::make_nvp("init_time", timestamps.app_start_time));
         archive(cereal::make_nvp("fini_time", timestamps.app_end_time));
+        {
+            auto drops = observed_buffer_drops().snapshot();
+            uint64_t total_dropped = 0;
+            for(const auto& row : drops) total_dropped += row.dropped;
+            archive(cereal::make_nvp("dropped_records", total_dropped));
+            archive.setNextName("buffer_drop_observations");
+            archive.startNode(); archive.makeArray();
+            for(const auto& row : drops)
+            {
+                archive.startNode();
+                archive(cereal::make_nvp("buffer_id", row.buffer));
+                archive(cereal::make_nvp("cumulative_dropped", row.dropped));
+                archive(cereal::make_nvp("callbacks", row.callbacks));
+                archive(cereal::make_nvp("counter_regressions", row.regressions));
+                archive.finishNode();
+            }
+            archive.finishNode();
+        }
         archive(cereal::make_nvp("config", cfg));
         archive(cereal::make_nvp("command", common::read_command_line(this_pid)));
 
@@ -4317,6 +4350,21 @@ generate_output(cleanup_mode _cleanup_mode, bool skip_output = false)
     {
         auto json_ar = tool::open_json(tool::get_config());
 
+        // Capture cumulative drop counts after buffered records have been drained.
+        auto drops = observed_buffer_drops().snapshot();
+        tool_metadata->dropped_records = 0;
+        tool_metadata->buffer_drop_observations.clear();
+        for(const auto& row : drops)
+        {
+            tool_metadata->dropped_records += row.dropped;
+            tool_metadata->buffer_drop_observations.push_back(
+                {row.buffer, row.dropped, row.callbacks, row.regressions});
+        }
+        rocprofiler_experimental_get_dispatch_strict_bound_wait(
+            &tool_metadata->strict_future_bound_count,
+            &tool_metadata->strict_future_bound_max_gap_ns,
+            &tool_metadata->strict_future_bound_total_wait_ns,
+            &tool_metadata->strict_future_bound_wait_limit_ns);
         json_ar.start_process();
         tool::write_json(json_ar, tool::get_config(), *tool_metadata, getpid());
         tool::write_json(json_ar,

@@ -173,6 +173,20 @@ struct metadata
     node_info                                node_data                  = {};
     std::vector<std::string>                 command_line               = {};
 
+    struct buffer_drop_observation
+    {
+        uint64_t buffer_id = 0;
+        uint64_t cumulative_dropped = 0;
+        uint64_t callbacks = 0;
+        uint64_t counter_regressions = 0;
+    };
+    uint64_t dropped_records = 0;
+    std::vector<buffer_drop_observation> buffer_drop_observations = {};
+    uint64_t strict_future_bound_count = 0;
+    uint64_t strict_future_bound_max_gap_ns = 0;
+    uint64_t strict_future_bound_total_wait_ns = 0;
+    uint64_t strict_future_bound_wait_limit_ns = 0;
+
     // PMC event ids start at this number
     uint64_t pmc_event_offset = 1;
 
