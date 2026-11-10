@@ -1086,7 +1086,8 @@ WriteInterceptor(const void* packets,
         {
             transformed_packets.emplace_back(*barrier);
         }
-        // Command is only executed if GLOG_v=2 or higher, otherwise it is a no-op
+        // ROCP_TRACE uses VLOG(4); enable it with ROCPROFILER_LOG_LEVEL=trace.
+        // The logged QueueID is the HSA queue's numeric ID, not its pointer.
         ROCP_TRACE << fmt::format("QueueID {}: {}",
                                   queue.get_id().handle,
                                   fmt::join(transformed_packets, fmt::format(" ")));
