@@ -72,6 +72,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // static assert for rocprofiler_packet ABI compatibility
 static_assert(sizeof(hsa_ext_amd_aql_pm4_packet_t) == sizeof(hsa_kernel_dispatch_packet_t),
@@ -432,7 +433,7 @@ bit_extract(Integral x, int first, int last)
 void
 WriteInterceptor(const void* packets,
                  uint64_t    pkt_count,
-                 uint64_t,
+                 uint64_t    user_pkt_index,
                  void*                                 data,
                  hsa_amd_queue_intercept_packet_writer writer)
 {
@@ -465,6 +466,35 @@ WriteInterceptor(const void* packets,
     ROCP_FATAL_IF(data == nullptr) << "WriteInterceptor was not passed a pointer to the queue";
 
     auto& queue = *static_cast<Queue*>(data);
+
+    // ROCr 7.2.0 can pass a pointer into the legacy intercept queue's ring
+    // even when this batch crosses its end. Reconstruct that case before any
+    // packet inspection or forwarding. Newer runtimes that supply a contiguous
+    // buffer do not meet the pointer check and retain their original path.
+    static const bool wrap_safe_intercept_batch = common::get_env(
+        "ROCPROFILER_EXPERIMENTAL_WRAP_SAFE_INTERCEPT_BATCH", false);
+    auto wrapped_packets = std::vector<rocprofiler_packet>{};
+    if(wrap_safe_intercept_batch && pkt_count > 0)
+    {
+        static_assert(sizeof(rocprofiler_packet) == 64, "AQL packet size changed");
+        const auto* hsa_queue = queue.intercept_queue();
+        ROCP_FATAL_IF(hsa_queue == nullptr || hsa_queue->base_address == nullptr ||
+                      hsa_queue->size == 0 || pkt_count > hsa_queue->size)
+            << "Invalid legacy intercept queue or packet count";
+        const auto size   = static_cast<uint64_t>(hsa_queue->size);
+        const auto offset = user_pkt_index % size;
+        const auto* ring   = static_cast<const rocprofiler_packet*>(hsa_queue->base_address);
+        if(pkt_count > size - offset && packets == static_cast<const void*>(ring + offset))
+        {
+            wrapped_packets.reserve(pkt_count);
+            for(uint64_t index = 0; index < pkt_count; ++index)
+                wrapped_packets.emplace_back(ring[(offset + index) % size]);
+            packets = wrapped_packets.data();
+            ROCP_WARNING << fmt::format("QueueWrapSafe id={} first={} offset={} count={} size={}",
+                                        queue.get_id().handle, user_pkt_index, offset,
+                                        pkt_count, size);
+        }
+    }
 
     auto*      gls                 = ::rocprofiler::hip::graph::current_launch_state();
     const bool graph_launch_active = (gls != nullptr);
@@ -1086,7 +1116,8 @@ WriteInterceptor(const void* packets,
         {
             transformed_packets.emplace_back(*barrier);
         }
-        // Command is only executed if GLOG_v=2 or higher, otherwise it is a no-op
+        // ROCP_TRACE uses VLOG(4); enable it with ROCPROFILER_LOG_LEVEL=trace.
+        // The logged QueueID is the HSA queue's numeric ID, not its pointer.
         ROCP_TRACE << fmt::format("QueueID {}: {}",
                                   queue.get_id().handle,
                                   fmt::join(transformed_packets, fmt::format(" ")));

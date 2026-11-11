@@ -107,6 +107,24 @@ write_json(json_output&         json_ar,
         json_ar(cereal::make_nvp("pid", pid));
         json_ar(cereal::make_nvp("init_time", tool_metadata.process_start_ns));
         json_ar(cereal::make_nvp("fini_time", tool_metadata.process_end_ns));
+        json_ar(cereal::make_nvp("dropped_records", tool_metadata.dropped_records));
+        json_ar(cereal::make_nvp("strict_future_bound_count", tool_metadata.strict_future_bound_count));
+        json_ar(cereal::make_nvp("strict_future_bound_max_gap_ns", tool_metadata.strict_future_bound_max_gap_ns));
+        json_ar(cereal::make_nvp("strict_future_bound_total_wait_ns", tool_metadata.strict_future_bound_total_wait_ns));
+        json_ar(cereal::make_nvp("strict_future_bound_wait_limit_ns", tool_metadata.strict_future_bound_wait_limit_ns));
+        json_ar.setNextName("buffer_drop_observations");
+        json_ar.startNode();
+        json_ar.makeArray();
+        for(const auto& row : tool_metadata.buffer_drop_observations)
+        {
+            json_ar.startNode();
+            json_ar(cereal::make_nvp("buffer_id", row.buffer_id));
+            json_ar(cereal::make_nvp("cumulative_dropped", row.cumulative_dropped));
+            json_ar(cereal::make_nvp("callbacks", row.callbacks));
+            json_ar(cereal::make_nvp("counter_regressions", row.counter_regressions));
+            json_ar.finishNode();
+        }
+        json_ar.finishNode();
         json_ar(cereal::make_nvp("command", tool_metadata.command_line));
         json_ar(cereal::make_nvp("config", cfg));
         json_ar.finishNode();

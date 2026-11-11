@@ -75,7 +75,8 @@ inline profiling_time
 adjust_profiling_time(std::string_view _label,
                       std::string_view _responsible,
                       profiling_time   _value,
-                      profiling_time&& _bounds)
+                      profiling_time&& _bounds,
+                      bool              _strict_override = false)
 {
     static auto sysclock_period = hsa::get_hsa_timestamp_period();
     static auto normalize_env   = common::get_env("ROCPROFILER_CI_FREQ_SCALE_TIMESTAMPS", false);
@@ -85,7 +86,7 @@ adjust_profiling_time(std::string_view _label,
     // normalize
     if(ROCPROFILER_UNLIKELY(normalize_env)) _value *= sysclock_period;
 
-    if(strict_ts_env)
+    if(strict_ts_env || _strict_override)
     {
         ROCP_FATAL_IF(ROCPROFILER_UNLIKELY(_value.start > _value.end))
             << fmt::format("{} returned invalid {} time value: {} start time is greater than the "
