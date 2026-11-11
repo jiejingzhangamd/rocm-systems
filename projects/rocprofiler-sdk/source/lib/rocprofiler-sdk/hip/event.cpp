@@ -72,6 +72,18 @@ wait_disposition_enabled()
     return enabled;
 }
 
+// Opt-in snapshot of CLR's original event signal immediately before its wait call.
+// This records whether a missing barrier was already complete at submission.
+bool
+wait_signal_snapshot_enabled()
+{
+    static const bool enabled = []() {
+        const auto* value = std::getenv("ROCPROFILER_EXPERIMENTAL_EVENT_WAIT_SIGNAL");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
 bool
 barrier_packet_log_enabled()
 {
@@ -729,8 +741,34 @@ stream_wait_event_impl(hipStream_t stream, hipEvent_t event, unsigned int flags)
     // is in the map before CLR can enqueue any barrier carrying the dep_signal,
     // even if another thread concurrently submits work to the waiting stream.
     const auto registered_signal = register_deferred_wait(hip_event_handle, stream);
+    // Query the original record-generation signal before CLR can decide to skip
+    // a completed dependency. The diagnostic flag is disabled by default.
+    const auto snapshot_signal = wait_signal_snapshot_enabled() && registered_signal != 0;
+    const auto pre_wait_value = snapshot_signal
+                                    ? hsa::get_core_table()->hsa_signal_load_relaxed_fn(
+                                          hsa_signal_t{registered_signal})
+                                    : hsa_signal_value_t{0};
 
     auto ret = (get_saved_table().*SavedField)(stream, event, flags);
+    const auto post_wait_value = snapshot_signal
+                                     ? hsa::get_core_table()->hsa_signal_load_relaxed_fn(
+                                           hsa_signal_t{registered_signal})
+                                     : hsa_signal_value_t{0};
+    if(snapshot_signal)
+    {
+        auto* current_corr = context::get_latest_correlation_id();
+        std::fprintf(stderr,
+                     "ROCPROFILER_EVENT_WAIT_SIGNAL pid=%d correlation=%llu event=%llu "
+                     "signal=%llu pre_value=%lld post_value=%lld return_code=%d barrier_captured=%d\n",
+                     static_cast<int>(getpid()),
+                     static_cast<unsigned long long>(current_corr ? current_corr->internal : 0),
+                     static_cast<unsigned long long>(hip_event_handle),
+                     static_cast<unsigned long long>(registered_signal),
+                     static_cast<long long>(pre_wait_value),
+                     static_cast<long long>(post_wait_value),
+                     static_cast<int>(ret),
+                     static_cast<int>(g_active_event_ctx.barrier_captured));
+    }
 
     if(wait_disposition_enabled())
     {
