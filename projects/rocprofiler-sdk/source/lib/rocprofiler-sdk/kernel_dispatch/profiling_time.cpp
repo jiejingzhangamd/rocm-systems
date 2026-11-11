@@ -44,7 +44,7 @@ namespace
 // whether a dispatch belongs to the selected strict window.
 std::atomic<uint64_t> selected_start{std::numeric_limits<uint64_t>::max()};
 std::atomic<uint64_t> selected_end{0};
-constexpr uint64_t strict_bound_wait_limit_ns = 10000;
+constexpr uint64_t strict_bound_wait_limit_ns = 100000;
 std::atomic<uint64_t> future_bound_count{0};
 std::atomic<uint64_t> future_bound_max_gap_ns{0};
 std::atomic<uint64_t> future_bound_total_wait_ns{0};
@@ -110,7 +110,7 @@ get_dispatch_time(hsa_agent_t             _hsa_agent,
     auto dispatch_time_status = hsa::get_amd_ext_table()->hsa_amd_profiling_get_dispatch_time_fn(
         _hsa_agent, _signal, &dispatch_time);
     // Bound the observation after the runtime query has returned. In the
-    // opt-in selected window, give the system clock at most 10 us to catch up
+    // opt-in selected window, give the system clock at most 100 us to catch up
     // with a GPU end timestamp; never change the raw GPU interval.
     const auto first_ts = common::timestamp_ns();
     auto ts = first_ts;

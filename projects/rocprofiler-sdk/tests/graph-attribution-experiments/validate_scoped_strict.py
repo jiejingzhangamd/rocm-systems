@@ -37,12 +37,12 @@ def main():
 
     disabled = (2**64 - 1, 0)
     require(bounds() == disabled, "The strict window must be disabled by default")
-    require(wait_values() == (0, 0, 0, 10000), "Unexpected default bound-wait observations")
+    require(wait_values() == (0, 0, 0, 100000), "Unexpected default bound-wait observations")
     require(not contains(0) and not contains(2**64 - 1),
             "A disabled window selected a dispatch")
     setter(100, 200)
     require(bounds() == (100, 200), "Strict window readback differs from the set bounds")
-    require(wait_values() == (0, 0, 0, 10000), "New window did not reset wait observations")
+    require(wait_values() == (0, 0, 0, 100000), "New window did not reset wait observations")
     for timestamp, expected in ((99, False), (100, True), (150, True),
                                 (200, True), (201, False)):
         require(bool(contains(timestamp)) is expected,
@@ -56,7 +56,7 @@ def main():
                       "selected_enqueue_bounds": [100, 200],
                       "outside_enqueue_rejected": [99, 201],
                       "invalid_window_disables": True,
-                      "bounded_wait_limit_ns": 10000}))
+                      "bounded_wait_limit_ns": 100000}))
 
 
 if __name__ == "__main__":
