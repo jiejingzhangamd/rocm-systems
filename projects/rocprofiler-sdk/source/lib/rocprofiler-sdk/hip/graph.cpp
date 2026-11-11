@@ -42,6 +42,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -54,6 +55,8 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>
 
 namespace rocprofiler
 {
@@ -159,6 +162,18 @@ experimental_fillbuffer_enabled()
     return enabled;
 }
 
+// Opt-in capture-only identity record. This is a HIP graph node handle, not
+// launch_state::node_counter, which is an enqueue ordinal rather than a DAG edge.
+bool
+experimental_capture_node_identity_enabled()
+{
+    static const bool enabled = [] {
+        auto* value = std::getenv("ROCPROFILER_EXPERIMENTAL_CAPTURE_NODE_IDENTITY");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
 // A stream capture begun on this thread.
 struct capture_session
 {
@@ -254,6 +269,24 @@ attribute_new_nodes(capture_session& session, uint64_t correlation_id)
     for(size_t i = session.known; i < count && i < nodes.size(); ++i)
     {
         auto node = captured_node{nodes.at(i), correlation_id};
+        if(experimental_capture_node_identity_enabled())
+        {
+            auto type = hipGraphNodeTypeEmpty;
+            auto status = g_capture_api.node_get_type
+                              ? g_capture_api.node_get_type(node.node, &type)
+                              : hipErrorNotSupported;
+            std::fprintf(stderr,
+                         "ROCPROFILER_CAPTURE_NODE pid=%d graph=%llu node=%llu "
+                         "source=%llu type=%d type_status=%d timestamp=%llu\n",
+                         static_cast<int>(getpid()),
+                         static_cast<unsigned long long>(
+                             reinterpret_cast<uintptr_t>(session.graph)),
+                         static_cast<unsigned long long>(
+                             reinterpret_cast<uintptr_t>(node.node)),
+                         static_cast<unsigned long long>(correlation_id),
+                         static_cast<int>(type), static_cast<int>(status),
+                         static_cast<unsigned long long>(common::timestamp_ns()));
+        }
         if(experimental_fillbuffer_enabled() && g_capture_api.node_get_type &&
            g_capture_api.memset_node_params)
         {
