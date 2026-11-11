@@ -45,9 +45,12 @@
 #include <hip/amd_detail/hip_api_trace.hpp>
 
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string_view>
 #include <unordered_map>
+#include <unistd.h>
 
 namespace rocprofiler
 {
@@ -56,6 +59,55 @@ namespace hip
 namespace event
 {
 using profiling_time = tracing::profiling_time;
+
+// Diagnostic-only account of waits which never produce a native barrier record.
+// Keep this off for performance captures; stderr is part of the private server log.
+bool
+wait_disposition_enabled()
+{
+    static const bool enabled = []() {
+        const auto* value = std::getenv("ROCPROFILER_EXPERIMENTAL_EVENT_WAIT_DISPOSITION");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+bool
+barrier_packet_log_enabled()
+{
+    static const bool enabled = []() {
+        const auto* value = std::getenv("ROCPROFILER_EXPERIMENTAL_EVENT_BARRIER_PACKET");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+bool
+barrier_gpu_time_enabled()
+{
+    static const bool enabled = []() {
+        const auto* value = std::getenv("ROCPROFILER_EXPERIMENTAL_EVENT_GPU_TIME");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
+void
+log_wait_disposition(const char* phase,
+                     uint64_t    correlation,
+                     uint64_t    event_handle,
+                     uint64_t    signal_handle)
+{
+    if(!wait_disposition_enabled()) return;
+    std::fprintf(stderr,
+                 "ROCPROFILER_EVENT_WAIT_DISPOSITION phase=%s pid=%d correlation=%llu "
+                 "event=%llu signal=%llu\n",
+                 phase,
+                 static_cast<int>(getpid()),
+                 static_cast<unsigned long long>(correlation),
+                 static_cast<unsigned long long>(event_handle),
+                 static_cast<unsigned long long>(signal_handle));
+}
 
 // Per-thread record of the HIP event API call currently executing on this thread. The
 // barrier interception below consults it to attribute an in-flight barrier packet to the
@@ -568,6 +620,7 @@ discard_pending_wait(uint64_t signal_handle, uint64_t hip_event_handle)
     auto pw = consume_pending_wait_for_handle(signal_handle, hip_event_handle);
     if(pw.corr_id_ref)
     {
+        log_wait_disposition("DISCARD", pw.internal_corr_id, pw.hip_event_handle, signal_handle);
         pw.corr_id_ref->sub_kern_count();
         pw.corr_id_ref->sub_ref_count();
     }
@@ -578,7 +631,13 @@ uint64_t
 register_deferred_wait(uint64_t hip_event_handle, hipStream_t wait_stream)
 {
     auto event_info = lookup_event_info(hip_event_handle);
-    if(event_info.original_signal == 0) return 0;
+    auto* current_corr = wait_disposition_enabled() ? context::get_latest_correlation_id() : nullptr;
+    auto  current_id   = current_corr ? current_corr->internal : 0;
+    if(event_info.original_signal == 0)
+    {
+        log_wait_disposition("NO_RECORD", current_id, hip_event_handle, 0);
+        return 0;
+    }
 
     // CLR returns early from Event::streamWait when the wait targets the stream the event
     // was recorded on, so no GPU dependency is created and nothing will ever claim an
@@ -596,14 +655,22 @@ register_deferred_wait(uint64_t hip_event_handle, hipStream_t wait_stream)
     //
     // Also narrower than CLR, which compares event_->command().queue(): two distinct
     // streams backed by one queue are not caught here.
-    if(event_info.record_stream == wait_stream) return 0;
+    if(event_info.record_stream == wait_stream)
+    {
+        log_wait_disposition("SAME_STREAM", current_id, hip_event_handle, event_info.original_signal);
+        return 0;
+    }
 
     // CLR skips completed signals when it assembles a barrier's dependency list, so a
     // wait issued after the record barrier finished produces no GPU work to trace.
     // Completion is monotonic within a record generation, so refusing here can only
     // suppress waits CLR would have dropped as well. An event that completes after this
     // check leaves an entry that record_event_info or erase_event_info releases.
-    if(event_info.completed) return 0;
+    if(event_info.completed)
+    {
+        log_wait_disposition("ALREADY_COMPLETE", current_id, hip_event_handle, event_info.original_signal);
+        return 0;
+    }
 
     auto tracing_data = tracing::tracing_data{};
     tracing::populate_contexts(
@@ -665,6 +732,16 @@ stream_wait_event_impl(hipStream_t stream, hipEvent_t event, unsigned int flags)
 
     auto ret = (get_saved_table().*SavedField)(stream, event, flags);
 
+    if(wait_disposition_enabled())
+    {
+        auto* current_corr = context::get_latest_correlation_id();
+        log_wait_disposition(g_active_event_ctx.barrier_captured ? "RETURN_BARRIER"
+                                                              : "RETURN_NO_BARRIER",
+                             current_corr ? current_corr->internal : 0,
+                             hip_event_handle,
+                             registered_signal);
+    }
+
     // Discard the pre-registered entry in cases where no GPU-side dependency was created:
     // - Error return: CLR did nothing.
     // - Graph capture: stream is being captured, no real barrier submitted.
@@ -723,6 +800,7 @@ record_event_info(uint64_t hip_event_handle, event_record_info_t info)
         {
             auto pw = consume_pending_wait_for_handle(old_signal, hip_event_handle);
             if(!pw.corr_id_ref) break;
+            log_wait_disposition("RERECORD_RELEASE", pw.internal_corr_id, pw.hip_event_handle, old_signal);
             pw.corr_id_ref->sub_kern_count();
             pw.corr_id_ref->sub_ref_count();
         }
@@ -776,7 +854,8 @@ erase_event_info(uint64_t hip_event_handle)
     // making a wrapped HIP call from that callback re-enters this map, so holding the
     // write lock across the decrement would deadlock against ourselves. Every other site
     // that releases a pending wait already drops the lock first.
-    auto released = common::container::small_vector<context::correlation_id*, 4>{};
+    auto released     = common::container::small_vector<context::correlation_id*, 4>{};
+    auto released_ids = common::container::small_vector<uint64_t, 4>{};
 
     // The scan below is linear in the whole map, so destroying M events would otherwise be
     // O(N*M). Nothing can be registered for this event when the global count is zero, and
@@ -788,7 +867,12 @@ erase_event_info(uint64_t hip_event_handle)
             {
                 if(it->second.hip_event_handle == hip_event_handle)
                 {
-                    if(it->second.corr_id_ref) released.emplace_back(it->second.corr_id_ref);
+                    if(it->second.corr_id_ref)
+                    {
+                        released.emplace_back(it->second.corr_id_ref);
+                        if(wait_disposition_enabled())
+                            released_ids.emplace_back(it->second.internal_corr_id);
+                    }
                     it = map.erase(it);
                     g_pending_wait_count.fetch_sub(1, std::memory_order_release);
                 }
@@ -799,8 +883,11 @@ erase_event_info(uint64_t hip_event_handle)
             }
         });
 
-    for(auto* corr_id : released)
+    for(size_t i = 0; i < released.size(); ++i)
     {
+        if(wait_disposition_enabled())
+            log_wait_disposition("DESTROY_RELEASE", released_ids[i], hip_event_handle, 0);
+        auto* corr_id = released[i];
         corr_id->sub_kern_count();
         corr_id->sub_ref_count();
     }
@@ -937,6 +1024,25 @@ BarrierAsyncSignalHandler(hsa_signal_value_t /*signal_v*/, void* data)
         auto  _internal_corr_id = (_corr_id) ? _corr_id->internal : 0;
         auto  _ancestor_corr_id = (_corr_id) ? _corr_id->ancestor : 0;
 
+        if(barrier_gpu_time_enabled())
+        {
+            auto raw_time = hsa_amd_profiling_dispatch_time_t{};
+            auto status = hsa::get_amd_ext_table()->hsa_amd_profiling_get_dispatch_time_fn(
+                barrier_session.queue.get_agent().get_hsa_agent(),
+                bdata.completion_signal, &raw_time);
+            std::fprintf(stderr,
+                         "ROCPROFILER_EVENT_GPU_TIME pid=%d correlation=%llu event=%llu "
+                         "operation=%u signal=%llu status=%u start=%llu end=%llu\n",
+                         static_cast<int>(getpid()),
+                         static_cast<unsigned long long>(_internal_corr_id),
+                         static_cast<unsigned long long>(bdata.callback_record.hip_event_handle),
+                         static_cast<unsigned>(bdata.operation),
+                         static_cast<unsigned long long>(bdata.completion_signal.handle),
+                         static_cast<unsigned>(status),
+                         static_cast<unsigned long long>(raw_time.start),
+                         static_cast<unsigned long long>(raw_time.end));
+        }
+
         // Mark ahead of the callbacks below so that tool callback duration does not widen
         // the window in which a wait can still be registered against a completed event.
         if(bdata.operation == ROCPROFILER_HIP_EVENT_RECORD)
@@ -1033,7 +1139,8 @@ plan_barrier(hsa::Queue&                    queue,
 
     const auto original_signal_handle = pkt.barrier_and.completion_signal.handle;
 
-    auto source_queue = queue.get_id();
+    auto     source_queue   = queue.get_id();
+    uint64_t expected_signal = 0;
     if(event_ctx->operation == ROCPROFILER_HIP_EVENT_RECORD)
     {
         record_event_info(event_ctx->hip_event_handle,
@@ -1044,7 +1151,42 @@ plan_barrier(hsa::Queue&                    queue,
     }
     else if(event_ctx->operation == ROCPROFILER_HIP_EVENT_WAIT)
     {
-        source_queue = lookup_event_info(event_ctx->hip_event_handle).queue_id;
+        const auto event_info = lookup_event_info(event_ctx->hip_event_handle);
+        source_queue   = event_info.queue_id;
+        expected_signal = event_info.original_signal;
+    }
+
+    if(barrier_packet_log_enabled() && event_ctx->operation == ROCPROFILER_HIP_EVENT_WAIT)
+    {
+        const auto packet_type = static_cast<uint32_t>(
+            (pkt.barrier_and.header >> HSA_PACKET_HEADER_TYPE) &
+            ((1U << HSA_PACKET_HEADER_WIDTH_TYPE) - 1U));
+        uint64_t deps[5] = {};
+        if(packet_type == HSA_PACKET_TYPE_BARRIER_AND)
+        {
+            for(size_t i = 0; i < 5; ++i)
+                deps[i] = pkt.barrier_and.dep_signal[i].handle;
+        }
+        else if(packet_type == HSA_PACKET_TYPE_VENDOR_SPECIFIC)
+        {
+            const auto& vpkt = reinterpret_cast<const hsa_amd_barrier_value_packet_t&>(pkt);
+            deps[0] = vpkt.signal.handle;
+        }
+        std::fprintf(stderr,
+                     "ROCPROFILER_EVENT_DIRECT_PLAN pid=%d correlation=%llu event=%llu "
+                     "type=%u expected_signal=%llu dep0=%llu dep1=%llu dep2=%llu "
+                     "dep3=%llu dep4=%llu original_completion=%llu\n",
+                     static_cast<int>(getpid()),
+                     static_cast<unsigned long long>(internal_corr_id),
+                     static_cast<unsigned long long>(event_ctx->hip_event_handle),
+                     packet_type,
+                     static_cast<unsigned long long>(expected_signal),
+                     static_cast<unsigned long long>(deps[0]),
+                     static_cast<unsigned long long>(deps[1]),
+                     static_cast<unsigned long long>(deps[2]),
+                     static_cast<unsigned long long>(deps[3]),
+                     static_cast<unsigned long long>(deps[4]),
+                     static_cast<unsigned long long>(pkt.barrier_and.completion_signal.handle));
     }
 
     _barrier_data.callback_record =
@@ -1255,7 +1397,11 @@ claim_deferred_wait(uint64_t dep_signal_handle)
     if(!has_pending_waits()) return;
 
     auto pw = consume_pending_wait(dep_signal_handle);
-    if(pw.corr_id_ref) g_staged_waits.emplace_back(std::move(pw));
+    if(pw.corr_id_ref)
+    {
+        log_wait_disposition("CLAIM_BARRIER", pw.internal_corr_id, pw.hip_event_handle, dep_signal_handle);
+        g_staged_waits.emplace_back(std::move(pw));
+    }
 }
 
 void
@@ -1263,10 +1409,42 @@ claim_deferred_waits(const hsa::rocprofiler_packet& pkt, uint32_t packet_type, b
 {
     if(!is_barrier) return;
 
+    // Diagnostic-only census of every intercepted barrier packet. A direct
+    // wait may consume its pending entry in plan_barrier before this callback,
+    // and a runtime no-op has no pending packet to claim.
+    auto* event_ctx = get_active_event_context();
+    const bool direct_intercepted = event_ctx && event_ctx->barrier_captured;
+    if(barrier_packet_log_enabled())
+    {
+        if(packet_type == HSA_PACKET_TYPE_BARRIER_AND)
+        {
+            for(const auto& dep : pkt.barrier_and.dep_signal)
+            {
+                if(dep.handle == 0) break;
+                std::fprintf(stderr,
+                             "ROCPROFILER_EVENT_BARRIER_PACKET pid=%d type=%u dep_signal=%llu "
+                             "completion_signal=%llu\n",
+                             static_cast<int>(getpid()), packet_type,
+                             static_cast<unsigned long long>(dep.handle),
+                             static_cast<unsigned long long>(pkt.barrier_and.completion_signal.handle));
+            }
+        }
+        else
+        {
+            const auto& vpkt = reinterpret_cast<const hsa_amd_barrier_value_packet_t&>(pkt);
+            if(vpkt.signal.handle != 0)
+                std::fprintf(stderr,
+                             "ROCPROFILER_EVENT_BARRIER_PACKET pid=%d type=%u dep_signal=%llu "
+                             "completion_signal=%llu\n",
+                             static_cast<int>(getpid()), packet_type,
+                             static_cast<unsigned long long>(vpkt.signal.handle),
+                             static_cast<unsigned long long>(vpkt.completion_signal.handle));
+        }
+    }
+
     // A barrier that plan_barrier already claimed for this thread's record or wait
     // reports through its own completion handler, so its dependencies are not rescanned.
-    auto* event_ctx = get_active_event_context();
-    if(event_ctx && event_ctx->barrier_captured) return;
+    if(direct_intercepted) return;
 
     if(packet_type == HSA_PACKET_TYPE_BARRIER_AND)
     {
