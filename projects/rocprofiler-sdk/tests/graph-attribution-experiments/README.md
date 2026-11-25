@@ -1,5 +1,24 @@
 # Graph capture attribution experiments
 
+## HIP registration argument lifetime
+
+`__hipRegisterFunction` can receive temporary string pointers. The native
+buffered JSON writer serializes those records after the caller has released
+them, so this experiment records their pointer values rather than dereferencing
+them. Kernel names remain available in code-object metadata. A real GPU
+regression exercises a JIT DSO that is unloaded before tool finalization:
+
+```bash
+hipcc --offload-arch=gfx950 -shared -fPIC register_lifetime_probe.hip -o /tmp/register_lifetime_probe.so
+rocprofv3 --hip-trace --kernel-trace --output-format json --output-directory /tmp/register-lifetime-output -- \
+  python3 register_lifetime_probe.py /tmp/register_lifetime_probe.so
+python3 validate_register_lifetime.py /tmp/register-lifetime-output/<host>/<pid>_results.json
+```
+
+Use a fresh output directory and a compatible ROCm image. The probe asserts its
+GPU result and unloads the DSO before process exit; the validator requires
+complete UTF-8 JSON and pointer-form registration arguments.
+
 This branch builds on ROCm/rocm-systems PRs #14204 and #14211 (head
 `2e35762550e20b13efb9637619654955ca6507ff`). It adds:
 

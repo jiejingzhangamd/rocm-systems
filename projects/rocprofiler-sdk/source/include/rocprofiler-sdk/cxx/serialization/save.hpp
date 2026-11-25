@@ -70,6 +70,7 @@
 #include <cereal/types/variant.hpp>
 #include <cereal/types/vector.hpp>
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -141,6 +142,35 @@ get_buffer_tracing_args(Tp& data)
     rocprofiler_iterate_buffer_tracing_record_args(record, populate_args_array, &ret);
 
     return ret;
+}
+
+inline auto
+get_buffer_tracing_hip_args(rocprofiler_buffer_tracing_hip_api_ext_record_t& data)
+{
+    if(data.kind != ROCPROFILER_BUFFER_TRACING_HIP_COMPILER_API_EXT ||
+       data.operation != ROCPROFILER_HIP_COMPILER_API_ID___hipRegisterFunction)
+        return get_buffer_tracing_args(data);
+
+    // The HIP compiler callback borrows both string pointers. JIT runtimes may
+    // release deviceFunction before rocprofv3 serializes its buffered record at
+    // process exit. Do not dereference either borrowed string during deferred
+    // output; kernel names remain available through code-object metadata.
+    const auto& v = data.args.__hipRegisterFunction;
+    auto pointer  = [](const auto* value) {
+        return utility::as_hex(reinterpret_cast<uintptr_t>(value));
+    };
+    return std::vector<buffer_tracing_args>{
+        {"void**", "modules", pointer(v.modules)},
+        {"const void*", "hostFunction", pointer(v.hostFunction)},
+        {"char*", "deviceFunction", pointer(v.deviceFunction)},
+        {"const char*", "deviceName", pointer(v.deviceName)},
+        {"unsigned int", "threadLimit", std::to_string(v.threadLimit)},
+        {"uint3*", "tid", pointer(v.tid)},
+        {"uint3*", "bid", pointer(v.bid)},
+        {"dim3*", "blockDim", pointer(v.blockDim)},
+        {"dim3*", "gridDim", pointer(v.gridDim)},
+        {"int*", "wSize", pointer(v.wSize)},
+    };
 }
 }  // namespace serialization
 }  // namespace sdk
@@ -666,7 +696,7 @@ void
 save(ArchiveT& ar, rocprofiler_buffer_tracing_hip_api_ext_record_t data)
 {
     save_buffer_tracing_api_record(ar, data);
-    auto args = sdk::serialization::get_buffer_tracing_args(data);
+    auto args = sdk::serialization::get_buffer_tracing_hip_args(data);
     ROCP_SDK_SAVE_VALUE("args", args);
     ROCP_SDK_SAVE_DATA_FIELD(retval);
 }
